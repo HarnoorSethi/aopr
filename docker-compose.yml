@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  aopr:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - TBA_AUTH_KEY=${TBA_AUTH_KEY}
+      - DB_PATH=/data/aopr.db
+      - HOST=0.0.0.0
+      - PORT=8000
+    volumes:
+      - aopr_data:/data
+    restart: unless-stopped
+
+volumes:
+  aopr_data:

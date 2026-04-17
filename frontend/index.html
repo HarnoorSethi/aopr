@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>AOPR Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/ag-grid-community@31.3.2/dist/ag-grid-community.min.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@31.3.2/styles/ag-grid.css"/>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@31.3.2/styles/ag-theme-alpine.css"/>
+  <style>
+    :root {
+      --bg:#0f1117; --surf:#1a1d27; --surf2:#111827; --border:#2a2d3a;
+      --accent:#4f8ef7; --green:#22c55e; --amber:#f59e0b; --red:#ef4444;
+      --muted:#6b7280; --text:#e2e8f0; --purple:#a78bfa; --cyan:#22d3ee;
+    }
+    *{box-sizing:border-box;margin:0;padding:0}
+    html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;overflow:hidden}
+    body{display:flex;flex-direction:column}
+
+    /* AG Grid */
+    .ag-theme-alpine{
+      --ag-background-color:var(--surf);--ag-odd-row-background-color:#1e2130;
+      --ag-header-background-color:#14172b;--ag-border-color:var(--border);
+      --ag-row-hover-color:#252840;--ag-selected-row-background-color:#1e3a5f;
+      --ag-foreground-color:var(--text);--ag-header-foreground-color:#94a3b8;
+      --ag-font-size:13px;--ag-row-height:42px;
+    }
+
+    /* Primitives */
+    .pill{display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600}
+    .pill-blue{background:#1e3a5f;color:#60a5fa}
+    .pill-green{background:#14532d;color:#4ade80}
+    .pill-amber{background:#451a03;color:#fbbf24}
+    .pill-red{background:#450a0a;color:#f87171}
+    .pill-muted{background:#1f2937;color:#9ca3af}
+
+    .card{background:var(--surf);border:1px solid var(--border);border-radius:12px}
+    .stat-card{background:var(--surf);border:1px solid var(--border);border-radius:10px;padding:9px 13px;min-width:108px;flex-shrink:0}
+
+    input[type=text],select{background:var(--surf2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:5px 10px;font-size:13px;outline:none;transition:border-color .15s}
+    input[type=text]:focus,select:focus{border-color:var(--accent)}
+    input[type=range]{accent-color:var(--accent);cursor:pointer}
+    input[type=checkbox]{accent-color:var(--accent);width:14px;height:14px;cursor:pointer}
+
+    .tab{padding:5px 13px;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer;border:none;background:transparent;color:var(--muted);transition:all .15s}
+    .tab.on{background:var(--accent);color:#fff}
+    .tab:hover:not(.on){color:var(--text)}
+
+    .btn{padding:5px 12px;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--text);transition:all .15s}
+    .btn:hover{border-color:var(--accent)}
+    .btn-primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+    .btn-primary:hover{opacity:.85}
+
+    .badge-fresh{background:#14532d;color:#86efac;padding:3px 10px;border-radius:8px;font-size:11px}
+    .badge-stale{background:#450a0a;color:#fca5a5;padding:3px 10px;border-radius:8px;font-size:11px}
+    .badge-sync{background:#1e3a5f;color:#93c5fd;padding:3px 10px;border-radius:8px;font-size:11px}
+
+    /* Detail panel */
+    #dp{width:360px;min-width:360px;display:none;flex-direction:column;border-left:1px solid var(--border);background:var(--surf);overflow:hidden}
+    #dp.open{display:flex}
+    #dp-body{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:12px}
+
+    /* Match history rows */
+    .mrow{background:var(--surf2);border-radius:8px;padding:8px 10px;font-size:12px;border-left:3px solid transparent}
+    .mrow.breaker{border-left-color:var(--red);opacity:.7}
+    .mrow.refunded{border-left-color:var(--green)}
+    .mrow.defended{border-left-color:var(--purple)}
+
+    /* Sparkline canvas */
+    .spark{display:block;width:100%;height:56px}
+
+    /* Help overlay */
+    #help-ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:100;align-items:center;justify-content:center}
+    #help-ov.open{display:flex}
+
+    /* Scrollbar */
+    ::-webkit-scrollbar{width:5px;height:5px}
+    ::-webkit-scrollbar-track{background:transparent}
+    ::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+
+    /* Spinner */
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .spinner{width:12px;height:12px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;display:inline-block;vertical-align:middle}
+  </style>
+</head>
+<body>
+
+<!-- ═══ TOPBAR ═══════════════════════════════════════════════════════════ -->
+<header style="background:var(--surf);border-bottom:1px solid var(--border)"
+        class="flex items-center gap-3 px-5 py-2.5 flex-shrink-0 flex-wrap">
+
+  <div style="line-height:1.2">
+    <div style="font-size:15px;font-weight:700;color:var(--accent)">AOPR Engine</div>
+    <div id="season-lbl" style="font-size:11px;color:var(--muted)">Loading…</div>
+  </div>
+
+  <div style="flex:1"></div>
+
+  <!-- Mode toggle -->
+  <div style="background:var(--surf2);border-radius:10px;padding:3px;display:flex;gap:1px">
+    <button id="btn-raw" class="tab on" onclick="setMode('raw')">Raw OPR</button>
+    <button id="btn-adj" class="tab"    onclick="setMode('aopr')">Defense-Adjusted</button>
+  </div>
+
+  <!-- Event filter -->
+  <select id="ev-sel" onchange="onEventChange()" style="max-width:200px">
+    <option value="">All Events</option>
+  </select>
+
+  <!-- Search -->
+  <input id="search" type="text" placeholder="Search team…" style="width:140px"
+         oninput="gridApi&&gridApi.setQuickFilter(this.value)"/>
+
+  <!-- Cache / sync badges -->
+  <span id="cache-badge" class="badge-fresh">● Fresh</span>
+  <span id="sync-badge"  style="display:none" class="badge-sync"><span class="spinner"></span> Syncing</span>
+
+  <button class="btn"         onclick="exportCSV()">↓ CSV</button>
+  <button class="btn"         onclick="toggleHelp()">? Glossary</button>
+  <button class="btn btn-primary" onclick="triggerRefresh()">↻ Refresh</button>
+</header>
+
+<!-- ═══ STAT CARDS ═══════════════════════════════════════════════════════ -->
+<div style="background:var(--surf);border-bottom:1px solid var(--border)"
+     class="flex items-center gap-2 px-5 py-2 overflow-x-auto flex-shrink-0">
+  <div class="stat-card"><p style="font-size:11px;color:var(--muted);margin-bottom:2px">Teams</p>   <p id="s-t"  style="font-size:20px;font-weight:700">—</p></div>
+  <div class="stat-card"><p style="font-size:11px;color:var(--muted);margin-bottom:2px">Matches</p> <p id="s-m"  style="font-size:20px;font-weight:700">—</p></div>
+  <div class="stat-card"><p style="font-size:11px;color:var(--muted);margin-bottom:2px">Events</p>  <p id="s-e"  style="font-size:20px;font-weight:700">—</p></div>
+  <div class="stat-card"><p style="font-size:11px;color:var(--muted);margin-bottom:2px">Noise σ</p> <p id="s-s"  style="font-size:20px;font-weight:700">—</p></div>
+  <div class="stat-card"><p style="font-size:11px;color:var(--muted);margin-bottom:2px">Avg Score</p><p id="s-a" style="font-size:20px;font-weight:700">—</p></div>
+  <div class="stat-card"><p style="font-size:11px;color:var(--muted);margin-bottom:2px">Defenders</p><p id="s-d" style="font-size:20px;font-weight:700">—</p></div>
+  <div class="stat-card"><p style="font-size:11px;color:var(--muted);margin-bottom:2px">Ridge λ</p><p id="s-damp" style="font-size:20px;font-weight:700" title="Adaptive ridge damping applied by the solver">—</p></div>
+  <div class="stat-card" style="min-width:130px"><p style="font-size:11px;color:var(--muted);margin-bottom:2px">Last Solve</p><p id="s-ts" style="font-size:13px;font-weight:600">—</p></div>
+</div>
+
+<!-- ═══ FILTER ROW ════════════════════════════════════════════════════════ -->
+<div style="background:var(--surf);border-bottom:1px solid var(--border)"
+     class="flex items-center flex-wrap gap-4 px-5 py-2 flex-shrink-0">
+  <label class="flex items-center gap-2" style="font-size:12px;color:#cbd5e1">
+    Role
+    <select id="f-role" onchange="applyFilters()">
+      <option value="all">All</option>
+      <option value="offense">Offense only</option>
+      <option value="defender">Defenders only</option>
+    </select>
+  </label>
+  <label class="flex items-center gap-2" style="font-size:12px;color:#cbd5e1">
+    <input type="checkbox" id="f-hide-low" onchange="applyFilters()"/>
+    Hide low-match
+  </label>
+  <label class="flex items-center gap-2" style="font-size:12px;color:#cbd5e1">
+    <input type="checkbox" id="f-hide-breakers" onchange="applyFilters()"/>
+    Hide breakers
+  </label>
+  <label class="flex items-center gap-2" style="font-size:12px;color:#cbd5e1">
+    Min matches
+    <input type="range" id="f-min" min="0" max="20" value="0" style="width:80px"
+           oninput="document.getElementById('f-min-v').textContent=this.value;applyFilters()"/>
+    <span id="f-min-v" style="min-width:14px">0</span>
+  </label>
+  <label class="flex items-center gap-2" style="font-size:12px;color:#cbd5e1">
+    <input type="checkbox" id="f-delta" onchange="applyDeltaSort()"/>
+    Sort by Δ impact
+  </label>
+</div>
+
+<!-- ═══ MAIN CONTENT ═════════════════════════════════════════════════════ -->
+<div style="flex:1;display:flex;overflow:hidden">
+
+  <!-- Grid -->
+  <div style="flex:1;display:flex;flex-direction:column;padding:10px;overflow:hidden">
+    <div id="grid" class="ag-theme-alpine" style="flex:1;border-radius:12px;overflow:hidden;border:1px solid var(--border)"></div>
+  </div>
+
+  <!-- Detail panel -->
+  <div id="dp">
+    <div style="flex-shrink:0;padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
+      <span id="dp-title" style="font-weight:700;font-size:15px">Team ####</span>
+      <button onclick="closeDetail()" style="background:none;border:none;cursor:pointer;color:var(--muted);font-size:18px;line-height:1">✕</button>
+    </div>
+    <div id="dp-body"></div>
+  </div>
+</div>
+
+<!-- ═══ GLOSSARY ══════════════════════════════════════════════════════════ -->
+<div id="help-ov" onclick="if(event.target===this)toggleHelp()">
+  <div class="card" style="max-width:520px;width:100%;margin:16px;padding:24px;max-height:85vh;overflow-y:auto">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+      <span style="font-weight:700;font-size:15px">Glossary</span>
+      <button onclick="toggleHelp()" style="background:none;border:none;cursor:pointer;color:var(--muted);font-size:20px;line-height:1">✕</button>
+    </div>
+    <dl style="display:flex;flex-direction:column;gap:12px;font-size:13px;color:#cbd5e1">
+      <div><dt style="font-weight:600;color:#fff;margin-bottom:2px">OPR</dt><dd>Offensive Power Rating — weighted sparse least-squares estimate of each team's share of their alliance's score.</dd></div>
+      <div><dt style="font-weight:600;color:#fff;margin-bottom:2px">DPR</dt><dd>Defensive Power Rating — same solve against the opposing alliance's score. Measures suppression.</dd></div>
+      <div><dt style="font-weight:600;color:#fff;margin-bottom:2px">AOPR</dt><dd>Adjusted OPR — re-solved after crediting back points suppressed by opposing defenders. Measures true offensive capability.</dd></div>
+      <div><dt style="font-weight:600;color:#fff;margin-bottom:2px">Δ Delta</dt><dd>AOPR − OPR. Large positive delta = this team's offense was meaningfully suppressed by defense.</dd></div>
+      <div><dt style="font-weight:600;color:#fff;margin-bottom:2px">Residual</dt><dd>Expected alliance score minus actual. Positive = underperformed (candidate for defensive refund).</dd></div>
+      <div><dt style="font-weight:600;color:#fff;margin-bottom:2px">Refund</dt><dd>Score credited back because the model attributes underperformance to opposing defense. Capped at the positive residual.</dd></div>
+      <div><dt style="font-weight:600;color:#fff;margin-bottom:2px">Defender</dt><dd>DPR &gt; 1.5× OPR with ≥6 matches and above the significance floor (10% of season max DPR).</dd></div>
+      <div><dt style="font-weight:600;color:#fff;margin-bottom:2px">Variability</dt><dd>Standard deviation of per-match residuals. Higher = more unpredictable match-to-match performance.</dd></div>
+      <div><dt style="font-weight:600;color:#fff;margin-bottom:2px">OPR Breaker</dt><dd>Alliance underperformed by &gt;2σ — likely mechanical failure or major penalty. Downweighted to 10% automatically.</dd></div>
+      <div><dt style="font-weight:600;color:#fff;margin-bottom:2px">Weighting</dt><dd>w = time decay (21-day half-life) × stage (quals 1.0 → finals 1.5) × event size (√(teams/40), clamped).</dd></div>
+    </dl>
+  </div>
+</div>
+
+<!-- ═══ SCRIPT ═══════════════════════════════════════════════════════════ -->
+<script>
+const API = '';
+let allData = [], mode = 'raw', gridApi = null, selEvent = '';
+
+// ─── Number formatters ─────────────────────────────────────────────────────
+const f1  = v => v == null ? '—' : (+v).toFixed(1);
+const f0  = v => v == null ? '—' : Math.round(+v);
+const sgn = v => v >= 0 ? '+' : '';
+
+// ─── Cell renderers ────────────────────────────────────────────────────────
+function teamCR(p) {
+  return `<span style="font-weight:700;color:#60a5fa;cursor:pointer" onclick="rowClick(${p.value})">${p.value}</span>`;
+}
+function oprCR(p) {
+  const hi = mode === 'raw';
+  return `<span style="font-family:monospace;font-weight:${hi?700:400};color:${hi?'#93c5fd':''}">${f1(p.value)}</span>`;
+}
+function aoprCR(p) {
+  const hi = mode === 'aopr';
+  return `<span style="font-family:monospace;font-weight:${hi?700:400};color:${hi?'#4ade80':''}">${f1(p.value)}</span>`;
+}
+function deltaCR(p) {
+  const v = p.value;
+  if (v == null) return '—';
+  const c = v > 0.5 ? '#4ade80' : v < -0.5 ? '#f87171' : '#9ca3af';
+  return `<span style="color:${c};font-weight:700;font-family:monospace">${sgn(v)}${f1(v)}</span>`;
+}
+function varCR(p) {
+  const v = p.value;
+  if (v == null) return '—';
+  const w = Math.min(Math.max(v * 1.5, 2), 52);
+  return `<span style="font-family:monospace;font-size:12px">${f1(v)}</span>
+          <span style="display:inline-block;width:${w}px;height:9px;background:var(--accent);opacity:.55;border-radius:2px;margin-left:4px;vertical-align:middle"></span>`;
+}
+function defCR(p)  { return p.value ? '<span class="pill pill-blue">🛡 Defender</span>' : ''; }
+function flagCR(p) {
+  const tags = [];
+  if (p.data?.low_match_warning) tags.push('<span class="pill pill-amber">Low matches</span>');
+  if (p.data?.breaker_count > 0)  tags.push(`<span class="pill pill-red" title="${p.data.breaker_count} breaker/excluded row(s)">⚡ ${p.data.breaker_count}</span>`);
+  return tags.join(' ');
+}
+
+// ─── Column definitions ────────────────────────────────────────────────────
+function cols() {
+  return [
+    { field:'rank',        headerName:'#',          width:56,  pinned:'left', sortable:false },
+    { field:'team_number', headerName:'Team',       width:86,  pinned:'left', cellRenderer:teamCR },
+    { field:'opr',         headerName:'Raw OPR',   width:103, sort:mode==='raw'?'desc':null,  cellRenderer:oprCR },
+    { field:'dpr',         headerName:'DPR',        width:98,  valueFormatter:p=>f1(p.value) },
+    { field:'aopr',        headerName:'AOPR',       width:103, sort:mode==='aopr'?'desc':null, cellRenderer:aoprCR },
+    { field:'delta',       headerName:'Δ',          width:85,  cellRenderer:deltaCR },
+    { field:'variability', headerName:'Variability',width:138, cellRenderer:varCR },
+    { field:'match_count', headerName:'Matches',    width:88 },
+    { field:'is_defender', headerName:'Role',       width:108, cellRenderer:defCR },
+    { field:'low_match_warning', headerName:'Flags',width:118, cellRenderer:flagCR },
+    { field:'nickname',    headerName:'Nickname',   flex:1,    minWidth:100 },
+  ];
+}
+
+// ─── Grid init ─────────────────────────────────────────────────────────────
+function initGrid() {
+  gridApi = agGrid.createGrid(document.getElementById('grid'), {
+    columnDefs: cols(),
+    rowData: [],
+    defaultColDef: { sortable:true, resizable:true, filter:true },
+    animateRows: true,
+    suppressCellFocus: true,
+    getRowStyle: p => {
+      if (p.data?.is_defender) return { borderLeft:'3px solid #3b82f6' };
+      if (p.data?.low_match_warning) return { opacity:'.55' };
+      return {};
+    },
+  });
+}
+
+// ─── Load ──────────────────────────────────────────────────────────────────
+async function loadAll() {
+  try {
+    const [meta, health, events] = await Promise.all([
+      fetch(`${API}/api/v1/meta`).then(r=>r.json()),
+      fetch(`${API}/api/v1/health`).then(r=>r.json()),
+      fetch(`${API}/api/v1/events`).then(r=>r.json()).catch(()=>[]),
+    ]);
+
+    // Stat bar
+    document.getElementById('s-t').textContent  = meta.total_teams    ?? '—';
+    document.getElementById('s-m').textContent  = meta.total_matches   ?? '—';
+    document.getElementById('s-e').textContent  = meta.total_events    ?? '—';
+    document.getElementById('s-s').textContent  = meta.noise_sigma != null ? (+meta.noise_sigma).toFixed(1) : '—';
+    document.getElementById('s-a').textContent  = meta.avg_score   != null ? (+meta.avg_score).toFixed(1)   : '—';
+    document.getElementById('s-d').textContent  = meta.defender_count  ?? '—';
+    // Solver diagnostics: damp value from OPR solve
+    const damp = meta.solver_info?.opr?.damp ?? meta.solver_info?.damp;
+    document.getElementById('s-damp').textContent = damp != null ? (+damp).toFixed(3) : '—';
+    document.getElementById('season-lbl').textContent = `${meta.year ?? ''} Season · Season-wide rolling model`;
+    if (meta.solve_timestamp) {
+      document.getElementById('s-ts').textContent = new Date(meta.solve_timestamp*1000).toLocaleTimeString();
+    }
+
+    // Cache badge
+    const cb = document.getElementById('cache-badge');
+    if (health.status === 'no_api_key') {
+      cb.className = 'badge-stale';
+      cb.textContent = '⚠ No TBA key';
+    } else if (health.data_stale) {
+      cb.className = 'badge-stale';
+      cb.textContent = '⚠ Stale';
+    } else {
+      cb.className = 'badge-fresh';
+      cb.textContent = '● Fresh';
+    }
+
+    // Event dropdown
+    const sel = document.getElementById('ev-sel');
+    const cur = sel.value;
+    while (sel.options.length > 1) sel.remove(1);
+    (events||[]).forEach(ev => sel.add(new Option(`${ev.name} (${ev.team_count || '?'})`, ev.event_key)));
+    if (cur) sel.value = cur;
+
+    await loadTeams();
+  } catch(e) {
+    console.error(e);
+    document.getElementById('season-lbl').textContent = 'Error — is the backend running on port 8000?';
+  }
+}
+
+async function loadTeams() {
+  let url = `${API}/api/v1/teams?sort_by=aopr&ascending=false`;
+  if (selEvent) url += `&event_key=${encodeURIComponent(selEvent)}`;
+  const teams = await fetch(url).then(r=>r.json()).catch(()=>[]);
+  allData = Array.isArray(teams) ? teams : [];
+  applyFilters();
+}
+
+// ─── Event change ──────────────────────────────────────────────────────────
+async function onEventChange() {
+  selEvent = document.getElementById('ev-sel').value;
+  await loadTeams();
+}
+
+// ─── Filters ───────────────────────────────────────────────────────────────
+function applyFilters() {
+  if (!gridApi) return;
+  const role        = document.getElementById('f-role').value;
+  const hideLow     = document.getElementById('f-hide-low').checked;
+  const hideBreakers= document.getElementById('f-hide-breakers').checked;
+  const minM        = parseInt(document.getElementById('f-min').value, 10);
+
+  let rows = allData.filter(r => {
+    if (minM > 0 && r.match_count < minM) return false;
+    if (hideLow && r.low_match_warning) return false;
+    if (hideBreakers && r.breaker_count > 0) return false;
+    if (role === 'offense' && r.is_defender) return false;
+    if (role === 'defender' && !r.is_defender) return false;
+    return true;
+  });
+  rows = rows.map((r,i) => ({...r, rank:i+1}));
+  gridApi.setGridOption('rowData', rows);
+}
+
+function applyDeltaSort() {
+  if (!gridApi) return;
+  const on = document.getElementById('f-delta').checked;
+  gridApi.applyColumnState({
+    state:[{colId:'delta', sort: on?'desc':null}],
+    defaultState:{sort:null},
+  });
+}
+
+// ─── Mode ──────────────────────────────────────────────────────────────────
+function setMode(m) {
+  mode = m;
+  document.getElementById('btn-raw').classList.toggle('on', m==='raw');
+  document.getElementById('btn-adj').classList.toggle('on', m==='aopr');
+  if (gridApi) { gridApi.setGridOption('columnDefs', cols()); applyFilters(); }
+}
+
+// ─── Export ────────────────────────────────────────────────────────────────
+function exportCSV() {
+  gridApi?.exportDataAsCsv({fileName:`aopr_${new Date().toISOString().slice(0,10)}.csv`});
+}
+
+// ─── Refresh ───────────────────────────────────────────────────────────────
+async function triggerRefresh() {
+  document.getElementById('sync-badge').style.display = '';
+  document.getElementById('cache-badge').style.display = 'none';
+  await fetch(`${API}/api/v1/season/refresh`, {method:'POST'}).catch(()=>{});
+  // Poll until the solve timestamp changes
+  const prevTs = document.getElementById('s-ts').textContent;
+  let attempts = 0;
+  const poll = setInterval(async () => {
+    try {
+      const h = await fetch(`${API}/api/v1/health`).then(r=>r.json());
+      const ts = h.last_solve ? new Date(h.last_solve*1000).toLocaleTimeString() : '';
+      if (ts && ts !== prevTs || ++attempts > 24) {
+        clearInterval(poll);
+        document.getElementById('sync-badge').style.display = 'none';
+        document.getElementById('cache-badge').style.display = '';
+        loadAll();
+      }
+    } catch(e) { if (++attempts > 24) clearInterval(poll); }
+  }, 5000);
+}
+
+// ─── Glossary ──────────────────────────────────────────────────────────────
+function toggleHelp() {
+  document.getElementById('help-ov').classList.toggle('open');
+}
+
+// ─── Detail panel ──────────────────────────────────────────────────────────
+function rowClick(num) {
+  const d = allData.find(r => r.team_number === num);
+  if (d) showDetail(d);
+}
+
+async function showDetail(data) {
+  const dp = document.getElementById('dp');
+  dp.classList.add('open');
+
+  const title = `Team ${data.team_number}${data.nickname ? ' — ' + data.nickname : ''}`;
+  document.getElementById('dp-title').textContent = title;
+
+  // Show skeleton while fetching match history
+  document.getElementById('dp-body').innerHTML = skeletonHTML();
+
+  // Fetch full match history
+  let matchRows = [];
+  try {
+    matchRows = await fetch(`${API}/api/v1/team/${data.team_number}/matches`).then(r=>r.json());
+  } catch(e) { matchRows = []; }
+
+  renderDetail(data, matchRows);
+}
+
+function renderDetail(data, matchRows) {
+  const allOPR  = allData.map(r=>r.opr).filter(v=>v!=null);
+  const allAOPR = allData.map(r=>r.aopr).filter(v=>v!=null);
+  const allDPR  = allData.map(r=>r.dpr).filter(v=>v!=null);
+
+  const totalRefund = matchRows.reduce((s,r) => s + (r.refund||0), 0);
+  const breakerCount = matchRows.filter(r=>r.is_breaker).length;
+
+  document.getElementById('dp-body').innerHTML = `
+
+    <!-- Stat grid -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+      ${sc('Raw OPR',     f1(data.opr),           '#93c5fd')}
+      ${sc('DPR',         f1(data.dpr),           '#a78bfa')}
+      ${sc('AOPR',        f1(data.aopr),          '#4ade80')}
+      ${sc('Δ Delta', (data.delta>0?'+':'')+f1(data.delta), data.delta>0.5?'#4ade80':data.delta<-0.5?'#f87171':'#9ca3af')}
+      ${sc('Variability', f1(data.variability),   '#fbbf24')}
+      ${sc('Matches',     data.match_count,        '#e2e8f0')}
+    </div>
+
+    <!-- Tags -->
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      ${data.is_defender ? '<span class="pill pill-blue">🛡 Defender</span>' : '<span class="pill pill-green">⚡ Offense</span>'}
+      ${data.low_match_warning ? '<span class="pill pill-amber">Low matches</span>' : ''}
+      ${breakerCount > 0 ? `<span class="pill pill-red">⚡ ${breakerCount} breaker${breakerCount>1?'s':''}</span>` : ''}
+      ${totalRefund > 0.5 ? `<span class="pill pill-green">+${f1(totalRefund)} pts refunded</span>` : ''}
+    </div>
+
+    <!-- Ranking percentile bars -->
+    <div class="card" style="padding:12px">
+      <p style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Season Ranking</p>
+      ${pctBar('OPR',  data.opr,  allOPR)}
+      ${pctBar('DPR',  data.dpr,  allDPR)}
+      ${pctBar('AOPR', data.aopr, allAOPR)}
+    </div>
+
+    <!-- Sparkline -->
+    ${matchRows.length >= 2 ? `
+    <div class="card" style="padding:12px">
+      <p style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">
+        Match Performance Trend
+        <span style="color:var(--accent);font-weight:400;margin-left:6px">— actual</span>
+        <span style="color:var(--green);font-weight:400;margin-left:6px">— expected</span>
+      </p>
+      <canvas id="spark-canvas" class="spark"></canvas>
+    </div>` : ''}
+
+    <!-- Match history -->
+    <div>
+      <p style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">
+        Match History (${matchRows.length})
+      </p>
+      ${matchRows.length === 0
+        ? '<p style="font-size:12px;color:var(--muted);font-style:italic">No match history available yet.</p>'
+        : matchRows.map(mrow).join('')}
+    </div>
+  `;
+
+  // Draw sparkline after DOM is ready
+  if (matchRows.length >= 2) {
+    requestAnimationFrame(() => drawSparkline('spark-canvas', matchRows));
+  }
+}
+
+function skeletonHTML() {
+  return `<div style="display:flex;flex-direction:column;gap:10px;padding:4px">
+    ${[90,70,110,60,85].map(w => `
+      <div style="height:16px;background:var(--border);border-radius:6px;width:${w}%;opacity:.4;animation:pulse 1.5s ease-in-out infinite"></div>
+    `).join('')}
+  </div>`;
+}
+
+function sc(label, value, color='#e2e8f0') {
+  return `<div style="background:var(--surf2);border-radius:8px;padding:8px 10px">
+    <p style="font-size:11px;color:var(--muted);margin-bottom:2px">${label}</p>
+    <p style="font-weight:700;color:${color}">${value}</p>
+  </div>`;
+}
+
+function pctBar(label, val, allVals) {
+  const sorted = [...allVals].sort((a,b)=>b-a);
+  const rank = sorted.findIndex(v => v <= val) + 1 || sorted.length;
+  const pct  = sorted.length > 1 ? Math.round((1-(rank-1)/(sorted.length-1))*100) : 100;
+  return `<div style="margin-bottom:8px">
+    <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-bottom:3px">
+      <span>${label}</span>
+      <span style="color:var(--text)">Top ${pct}%&nbsp;&nbsp;#${rank} of ${sorted.length}</span>
+    </div>
+    <div style="background:var(--border);border-radius:4px;height:5px">
+      <div style="background:var(--accent);border-radius:4px;height:100%;width:${pct}%;transition:width .4s ease"></div>
+    </div>
+  </div>`;
+}
+
+function mrow(r) {
+  const mk = r.match_key ? r.match_key.split('_').pop().toUpperCase() : '?';
+  const hasRefund   = r.refund > 0.5;
+  const hasDefender = r.defender_keys && r.defender_keys.length > 0;
+  const cls = r.is_breaker ? 'breaker' : hasRefund ? 'refunded' : hasDefender ? 'defended' : '';
+  const sideColor = r.side === 'red' ? '#f87171' : '#60a5fa';
+
+  return `<div class="mrow ${cls}" style="margin-bottom:4px">
+    <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-family:monospace;font-size:11px;color:#94a3b8">${mk}</span>
+        <span style="width:8px;height:8px;border-radius:50%;background:${sideColor};display:inline-block"></span>
+        <span style="font-size:10px;color:${sideColor}">${r.side?.toUpperCase()}</span>
+        ${r.is_breaker ? '<span class="pill pill-red" style="font-size:10px">breaker</span>' : ''}
+        ${hasRefund    ? `<span class="pill pill-green" style="font-size:10px">+${f1(r.refund)} refund</span>` : ''}
+      </div>
+      <span style="font-size:11px;color:var(--muted)">${r.event_name ? r.event_name.split(' ').slice(0,2).join(' ') : ''}</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;font-size:11px">
+      <div><span style="color:var(--muted)">Actual</span><br/><b style="color:#e2e8f0">${f0(r.actual_score)}</b></div>
+      <div><span style="color:var(--muted)">Expected</span><br/><b style="color:#94a3b8">${f1(r.expected_score)}</b></div>
+      <div><span style="color:var(--muted)">Residual</span><br/><b style="${r.residual>0?'color:#f87171':'color:#4ade80'}">${sgn(r.residual)}${f1(r.residual)}</b></div>
+    </div>
+    ${hasDefender ? `<div style="margin-top:4px;font-size:10px;color:var(--muted)">🛡 ${r.defender_keys.join(', ')}</div>` : ''}
+  </div>`;
+}
+
+// ─── Sparkline ─────────────────────────────────────────────────────────────
+function drawSparkline(canvasId, rows) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.offsetWidth;
+  const H = canvas.offsetHeight;
+  canvas.width  = W * dpr;
+  canvas.height = H * dpr;
+  ctx.scale(dpr, dpr);
+
+  const actuals  = rows.map(r => r.actual_score);
+  const expected = rows.map(r => r.expected_score);
+  const all = [...actuals, ...expected];
+  const lo = Math.min(...all) * 0.92;
+  const hi = Math.max(...all) * 1.05;
+  const n  = rows.length;
+
+  const xOf = i => (i / (n-1)) * (W - 12) + 6;
+  const yOf = v => H - 4 - ((v - lo) / (hi - lo)) * (H - 10);
+
+  // Zero line
+  ctx.strokeStyle = 'rgba(255,255,255,.05)';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, yOf(0)); ctx.lineTo(W, yOf(0)); ctx.stroke();
+
+  // Expected line (dashed green)
+  ctx.strokeStyle = '#22c55e';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  expected.forEach((v,i) => i === 0 ? ctx.moveTo(xOf(i), yOf(v)) : ctx.lineTo(xOf(i), yOf(v)));
+  ctx.stroke();
+
+  // Actual line (solid accent)
+  ctx.strokeStyle = '#4f8ef7';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  actuals.forEach((v,i) => i === 0 ? ctx.moveTo(xOf(i), yOf(v)) : ctx.lineTo(xOf(i), yOf(v)));
+  ctx.stroke();
+
+  // Breaker dots (red)
+  rows.forEach((r,i) => {
+    if (!r.is_breaker) return;
+    ctx.fillStyle = '#ef4444';
+    ctx.beginPath();
+    ctx.arc(xOf(i), yOf(r.actual_score), 4, 0, Math.PI*2);
+    ctx.fill();
+  });
+
+  // Refund dots (green)
+  rows.forEach((r,i) => {
+    if (!r.refund || r.refund < 0.5) return;
+    ctx.fillStyle = '#4ade80';
+    ctx.beginPath();
+    ctx.arc(xOf(i), yOf(r.actual_score), 3, 0, Math.PI*2);
+    ctx.fill();
+  });
+
+  // Endpoint dots
+  [0, n-1].forEach(i => {
+    ctx.fillStyle = '#4f8ef7';
+    ctx.beginPath();
+    ctx.arc(xOf(i), yOf(actuals[i]), 3.5, 0, Math.PI*2);
+    ctx.fill();
+  });
+}
+
+function closeDetail() {
+  document.getElementById('dp').classList.remove('open');
+}
+
+// ─── Init ──────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  initGrid();
+  loadAll();
+  setInterval(loadAll, 5 * 60 * 1000);
+});
+</script>
+</body>
+</html>
