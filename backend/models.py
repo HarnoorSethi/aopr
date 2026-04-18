@@ -16,6 +16,7 @@ class TeamStats(BaseModel):
     variability: float = Field(description="Match-to-match instability score")
     match_count: int
     breaker_count: int = Field(default=0, description="Matches flagged as OPR breakers or excluded")
+    is_defender: bool = Field(default=False, description="Whether the team was classified as a defender")
     primary_role: str = Field(default="", description="Algorithmic role classification")
     low_match_warning: bool = False
     rank: int = 0

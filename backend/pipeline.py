@@ -145,6 +145,7 @@ async def run_season_pipeline() -> Dict[str, Any]:
     bundle = build_matrices(all_matches, event_team_counts, event_types)
     team_list = bundle.team_list
     n_teams = len(team_list)
+    team_idx: Dict[int, int] = {t: i for i, t in enumerate(team_list)}
 
     # --- 4. Baseline OPR + DPR solve --------------------------------------
     opr, dpr, solver_info = solve_opr_dpr(
@@ -278,13 +279,13 @@ async def run_season_pipeline() -> Dict[str, Any]:
             "variability": _safe(variability.get(team, 0.0)),
             "match_count": mc,
             "breaker_count": team_breaker_counts.get(team, 0),
+            "is_defender": team in defenders,
             "primary_role": role,
             "low_match_warning": mc < CONFIG.min_matches_to_rank,
         }
 
     # --- 13. Build full match-row index (in-memory only, not persisted) ------
     #   Two rows per match. Each row records everything needed for team history.
-    team_idx: Dict[int, int] = {t: i for i, t in enumerate(team_list)}
     aopr_arr = np.asarray(aopr)
     opr_arr  = np.asarray(opr)
 
