@@ -8,10 +8,12 @@ class TeamStats(BaseModel):
     team_number: int
     nickname: str = ""
     opr: float = Field(description="Raw offensive power rating")
-    dpr: float = Field(description="Defensive power rating")
+    dpr: float = Field(description="Defensive power rating (quality-weighted by opponent alliance OPR)")
+    wdpr: float = Field(default=0.0, description="Weighted DPR: base weights × raw sum of opponents' OPR")
     synergy: float = Field(default=0.0, description="Average positive residual (Boost ceiling)")
     aopr: float = Field(description="Adjusted OPR after defensive refunds")
     event_opr: Optional[float] = Field(default=None, description="Event-specific OPR")
+    event_dpr: Optional[float] = Field(default=None, description="Event-specific DPR")
     delta: float = Field(description="AOPR − OPR")
     variability: float = Field(description="Match-to-match instability score")
     match_count: int

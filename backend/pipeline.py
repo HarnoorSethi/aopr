@@ -30,7 +30,7 @@ from config import CONFIG
 from tba_client import get_season_events, get_event_matches, get_event_teams, is_data_stale
 from match_normalizer import normalize_matches, MatchRecord
 from matrix_builder import build_matrices, MatrixBundle
-from solver import _choose_damp, solve_opr_dpr, solve_weighted
+from solver import _choose_damp, solve_opr_dpr, solve_weighted, solve_qdpr, solve_wdpr
 from metrics import (
     compute_residuals,
     compute_noise_sigma,
@@ -149,7 +149,8 @@ async def run_season_pipeline() -> Dict[str, Any]:
 
     # --- 4. Baseline OPR + DPR solve --------------------------------------
     opr, dpr, solver_info = solve_opr_dpr(
-        bundle.A, bundle.A_opp, bundle.y, bundle.y_opp, bundle.weights
+        bundle.A, bundle.A_opp, bundle.y, bundle.y_opp, bundle.weights,
+        dpr_weight_power=CONFIG.dpr_weight_power,
     )
 
     # --- 5. Residuals, noise sigma, two-tier anomaly detection --------------
@@ -162,12 +163,37 @@ async def run_season_pipeline() -> Dict[str, Any]:
     # --- 6. Rebuild matrices with breaker weights applied -----------------
     bundle = build_matrices(all_matches, event_team_counts, event_types)
 
-    # --- 7. Re-solve baseline with updated weights ------------------------
-    opr, dpr, solver_info = solve_opr_dpr(
-        bundle.A, bundle.A_opp, bundle.y, bundle.y_opp, bundle.weights
-    )
+    # --- 7. Final OPR solve (quality_weight-adjusted weights) ---------------
+    # OPR must come first; DPR (QDPR) depends on opponent OPRs.
+    opr, _, info_opr = solve_weighted(bundle.A, bundle.y, bundle.weights)
     residuals = compute_residuals(bundle.A, opr, bundle.y)
     sigma = compute_noise_sigma(residuals)
+
+    # Per-row opposing-alliance OPR — shared by both DPR and WDPR.
+    row_opp_oprs = np.zeros(len(bundle.y))
+    for ri, (mi, side) in enumerate(bundle.row_to_match):
+        m = all_matches[mi]
+        opp_teams = m.blue_teams if side == 0 else m.red_teams
+        row_opp_oprs[ri] = sum(max(opr[team_idx[t]], 0.0) for t in opp_teams if t in team_idx)
+
+    valid_opp = row_opp_oprs[row_opp_oprs > 0]
+    avg_opp_opr = float(np.mean(valid_opp)) if len(valid_opp) > 0 else 1.0
+
+    # DPR = quality-weighted DPR: each row scaled by opponent alliance OPR.
+    # Suppressing a strong alliance contributes more than suppressing a weak one.
+    # NOTE: operates on a similar scale to plain DPR (normalised by avg_opp_opr)
+    # but defender_threshold_multiplier may need retuning if results look off.
+    dpr, info_dpr = solve_qdpr(
+        bundle.A, bundle.y, bundle.weights, opr,
+        row_opp_oprs, avg_opp_opr,
+        dpr_weight_power=CONFIG.dpr_weight_power,
+    )
+    solver_info = {"opr": info_opr, "dpr": info_dpr}
+
+    # --- 7.5. WDPR (raw opponent-OPR-weighted DPR, unnormalised) -------------
+    wdpr, _ = solve_wdpr(
+        bundle.A, bundle.y, bundle.weights, opr, row_opp_oprs,
+    )
 
     # --- 8. Defender detection --------------------------------------------
     match_counts = compute_match_counts(bundle.A, team_list)
@@ -214,6 +240,7 @@ async def run_season_pipeline() -> Dict[str, Any]:
     opr  = np.where(np.isfinite(opr),  opr,  0.0)
     dpr  = np.where(np.isfinite(dpr),  dpr,  0.0)
     aopr = np.where(np.isfinite(aopr), aopr, 0.0)
+    wdpr = np.where(np.isfinite(wdpr), wdpr, 0.0)
 
     # --- 12. Assemble per-team results + Synergy + Roles ------------------
     results: Dict[int, Dict[str, Any]] = {}
@@ -273,6 +300,7 @@ async def run_season_pipeline() -> Dict[str, Any]:
             "nickname":    team_nicknames.get(team, ""),
             "opr":         _safe(opr[i]),
             "dpr":         _safe(dpr[i]),
+            "wdpr":        _safe(wdpr[i]),
             "synergy":     _safe(synergy),
             "aopr":        _safe(aopr[i]),
             "delta":       _safe(float(aopr[i]) - float(opr[i])),
@@ -342,8 +370,9 @@ async def run_season_pipeline() -> Dict[str, Any]:
     for t in team_match_rows:
         team_match_rows[t].sort(key=lambda r: r["timestamp"])
 
-    # --- 13.5 Compute Event OPRs ----------------------------------------------
+    # --- 13.5 Compute per-event OPR + DPR (quality-weighted) -----------------
     event_oprs: Dict[str, Dict[int, float]] = {}
+    event_dprs: Dict[str, Dict[int, float]] = {}
     for ek in event_meta.keys():
         ev_matches = [m for m in all_matches if m.event_key == ek]
         if not ev_matches:
@@ -351,18 +380,41 @@ async def run_season_pipeline() -> Dict[str, Any]:
         try:
             eb = build_matrices(ev_matches)
             e_opr, _, _ = solve_weighted(eb.A, eb.y, eb.weights)
-            e_dict = {}
+            e_team_idx = {t: i for i, t in enumerate(eb.team_list)}
+
+            e_row_opp_oprs = np.zeros(len(eb.y))
+            for ri, (mi, side) in enumerate(eb.row_to_match):
+                m = ev_matches[mi]
+                opp_teams = m.blue_teams if side == 0 else m.red_teams
+                e_row_opp_oprs[ri] = sum(
+                    max(e_opr[e_team_idx[t]], 0.0) for t in opp_teams if t in e_team_idx
+                )
+
+            valid_e_opp = e_row_opp_oprs[e_row_opp_oprs > 0]
+            e_avg_opp_opr = float(np.mean(valid_e_opp)) if len(valid_e_opp) > 0 else 1.0
+
+            e_dpr, _ = solve_qdpr(
+                eb.A, eb.y, eb.weights, e_opr,
+                e_row_opp_oprs, e_avg_opp_opr,
+                dpr_weight_power=CONFIG.dpr_weight_power,
+            )
+
+            opr_dict: Dict[int, float] = {}
+            dpr_dict: Dict[int, float] = {}
             for ti, team in enumerate(eb.team_list):
-                e_dict[team] = _safe(e_opr[ti])
-            event_oprs[ek] = e_dict
+                opr_dict[team] = _safe(e_opr[ti])
+                dpr_dict[team] = _safe(e_dpr[ti])
+            event_oprs[ek] = opr_dict
+            event_dprs[ek] = dpr_dict
         except Exception as exc:
-            logger.warning("Failed event OPR for %s: %s", ek, exc)
+            logger.warning("Failed event OPR/DPR for %s: %s", ek, exc)
 
     # --- 14. Persist audit + snapshot; keep match rows in memory only ---------
     save_audit_records(audit_rows)
     snapshot_payload = {
         "team_results": results,
         "event_oprs": event_oprs,
+        "event_dprs": event_dprs,
         "meta": {
             "year": year,
             "total_matches": len(all_matches),
@@ -425,5 +477,10 @@ def _coerce_keys(results: Dict[str, Any]) -> Dict[str, Any]:
         results["event_oprs"] = {
             ek: {int(t): opr for t, opr in val_dict.items()}
             for ek, val_dict in results["event_oprs"].items()
+        }
+    if "event_dprs" in results:
+        results["event_dprs"] = {
+            ek: {int(t): dpr for t, dpr in val_dict.items()}
+            for ek, val_dict in results["event_dprs"].items()
         }
     return results

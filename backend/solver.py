@@ -92,36 +92,92 @@ def solve_weighted(
 # Convenience: solve OPR + DPR in one call
 # ---------------------------------------------------------------------------
 
+def _build_y_dpr(y: np.ndarray, opr: np.ndarray, A: sp.spmatrix) -> np.ndarray:
+    """
+    Build the DPR target vector.
+    For each match pair (rows 2i, 2i+1): target is how many points the
+    *opposing* alliance was suppressed below its OPR expectation.
+    Pure Points Suppressed — empirically the most resilient FRC defensive metric.
+    """
+    y_pred = A.dot(opr)
+    res = y - y_pred
+    y_dpr = np.zeros_like(y)
+    for i in range(0, len(y), 2):
+        y_dpr[i] = -res[i + 1]
+        y_dpr[i + 1] = -res[i]
+    return y_dpr
+
+
 def solve_opr_dpr(
     A: sp.spmatrix,
     A_opp: sp.spmatrix,
     y: np.ndarray,
     y_opp: np.ndarray,
     weights: np.ndarray,
+    dpr_weight_power: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
     """
     Returns (opr_vector, dpr_vector, solver_info).
     Both solves share the same adaptive damp so diagnostics are comparable.
+    dpr_weight_power > 1.0 steepens the time-decay curve for the DPR solve,
+    giving more recent matches extra influence.
     """
-    # Compute damp from OPR system (same conditioning for both)
     sqrt_w = np.sqrt(np.clip(weights, 0.0, None))
     W = sp.diags(sqrt_w, format="csr")
     Aw = W @ A
     damp = _choose_damp(Aw)
 
     opr, _, info_opr = solve_weighted(A, y, weights, damp=damp)
-    
-    y_pred = A.dot(opr)
-    res = y - y_pred
-    
-    y_dpr = np.zeros_like(y)
 
-    for i in range(0, len(y), 2):
-        # Pure Points Suppressed: Target = Expected - Actual
-        # Empirically the most resilient FRC defensive tracking metric
-        y_dpr[i] = -res[i+1]
-        y_dpr[i+1] = -res[i]
-
-    dpr, _, info_dpr = solve_weighted(A, y_dpr, weights, damp=damp)
+    y_dpr = _build_y_dpr(y, opr, A)
+    dpr_weights = weights ** dpr_weight_power if dpr_weight_power != 1.0 else weights
+    dpr, _, info_dpr = solve_weighted(A, y_dpr, dpr_weights, damp=damp)
 
     return opr, dpr, {"opr": info_opr, "dpr": info_dpr}
+
+
+def solve_wdpr(
+    A: sp.spmatrix,
+    y: np.ndarray,
+    weights: np.ndarray,
+    opr: np.ndarray,
+    row_opp_oprs: np.ndarray,
+    damp: float | None = None,
+) -> Tuple[np.ndarray, dict]:
+    """
+    Weighted DPR: each match row's base weight is multiplied by the raw sum
+    of the opposing alliance's OPR values.  Suppressing a 90-OPR alliance
+    counts proportionally more than suppressing a 30-OPR alliance.
+    OPR must be solved before calling this function.
+
+    Returns (wdpr_vector, solver_info).
+    """
+    y_dpr = _build_y_dpr(y, opr, A)
+    wdpr_weights = weights * row_opp_oprs
+    wdpr, _, info = solve_weighted(A, y_dpr, wdpr_weights, damp=damp)
+    return wdpr, info
+
+
+def solve_qdpr(
+    A: sp.spmatrix,
+    y: np.ndarray,
+    weights: np.ndarray,
+    opr: np.ndarray,
+    row_opp_oprs: np.ndarray,
+    avg_opp_opr: float,
+    dpr_weight_power: float = 1.5,
+    damp: float | None = None,
+) -> Tuple[np.ndarray, dict]:
+    """
+    Quality-adjusted DPR: each match row is weighted by the opponent alliance's
+    combined OPR relative to the season average, so suppressing a strong team
+    is worth more than suppressing a weak one.  Also applies dpr_weight_power
+    for extra recency emphasis.
+
+    Returns (qdpr_vector, solver_info).
+    """
+    y_dpr = _build_y_dpr(y, opr, A)
+    quality_mult = np.clip(row_opp_oprs / max(avg_opp_opr, 1e-6), 0.25, 2.0)
+    qdpr_weights = (weights ** dpr_weight_power) * quality_mult
+    qdpr, _, info = solve_weighted(A, y_dpr, qdpr_weights, damp=damp)
+    return qdpr, info

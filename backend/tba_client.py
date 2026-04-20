@@ -106,7 +106,7 @@ def is_data_stale() -> bool:
 async def get_season_events(year: int) -> List[Dict]:
     """
     Fetch all events for a season, filtering out offseason and preseason entries.
-    Only returns events within the target year (by start_date).
+    Returns all events worldwide within the target year (by start_date).
     """
     data = await _tba_fetch(f"/events/{year}")
     if not isinstance(data, list):
@@ -121,11 +121,6 @@ async def get_season_events(year: int) -> List[Dict]:
         # Skip events whose start_date is not in the target year
         start = ev.get("start_date", "")
         if start and not start.startswith(str(year)):
-            continue
-            
-        # Filter strictly down to California to reduce API calls
-        state = ev.get("state_prov", "")
-        if state not in ("CA", "California"):
             continue
             
         filtered.append(ev)
