@@ -127,7 +127,7 @@ def _teams_for_event(results: Dict[str, Any], event_key: str) -> set:
 
 
 def _rank_rows(rows: list, sort_by: str, ascending: bool) -> list:
-    valid = {"opr", "dpr", "aopr", "delta", "variability", "match_count"}
+    valid = {"opr", "dpr", "wdpr", "aopr", "delta", "variability", "match_count"}
     key = sort_by if sort_by in valid else "aopr"
     rows.sort(key=lambda r: r.get(key, 0), reverse=not ascending)
     return [dict(r, rank=i + 1) for i, r in enumerate(rows)]
@@ -140,16 +140,23 @@ def _to_team_stats(r: dict) -> TeamStats:
         nickname=r.get("nickname", ""),
         opr=r["opr"],
         dpr=r["dpr"],
+        wdpr=r.get("wdpr", 0.0),
         synergy=r.get("synergy", 0.0),
         primary_role=r.get("primary_role", ""),
         aopr=r["aopr"],
         event_opr=r.get("event_opr"),
+        event_dpr=r.get("event_dpr"),
         delta=r["delta"],
+        delta_avg=r.get("delta_avg", 0.0),
+        delta_raw=r.get("delta_raw", 0.0),
         variability=r["variability"],
         match_count=r["match_count"],
         breaker_count=r.get("breaker_count", 0),
         is_defender=r["is_defender"],
         low_match_warning=r["low_match_warning"],
+        mean_contribution=r.get("mean_contribution", 0.0),
+        contribution_variance=r.get("contribution_variance", 0.0),
+        consistency=r.get("consistency", 0.0),
     )
 
 
@@ -261,16 +268,18 @@ async def event_stats(
             detail=f"Event '{event_key}' not found or has no team membership data.",
         )
 
-    # Attach event_opr exclusively for this event
+    # Attach event_opr and event_dpr for this event
     event_oprs = results.get("event_oprs", {}).get(event_key, {})
+    event_dprs = results.get("event_dprs", {}).get(event_key, {})
     rows = []
     for k, v in team_results.items():
         if k in allowed:
             row_copy = dict(v)
             row_copy["event_opr"] = event_oprs.get(k)
+            row_copy["event_dpr"] = event_dprs.get(k)
             rows.append(row_copy)
     primary = "opr" if mode == "raw" else "aopr"
-    sort_field = sort_by if sort_by in {"opr","dpr","aopr","delta","variability","match_count"} else primary
+    sort_field = sort_by if sort_by in {"opr","dpr","wdpr","aopr","delta","variability","match_count"} else primary
     rows = _rank_rows(rows, sort_field, ascending)
 
     ranked = [r for r in rows if r.get("match_count", 0) >= CONFIG.min_matches_to_rank]
@@ -350,8 +359,20 @@ async def all_teams(
 
     if event_key:
         allowed = _teams_for_event(results, event_key)
+        if not allowed:
+            # event_membership missing or stale — fall back to teams present in
+            # the per-event OPR solve, which is always derived from match data
+            allowed = set(results.get("event_oprs", {}).get(event_key, {}).keys())
         if allowed:
             team_results = {t: v for t, v in team_results.items() if t in allowed}
+            ev_oprs = results.get("event_oprs", {}).get(event_key, {})
+            ev_dprs = results.get("event_dprs", {}).get(event_key, {})
+            team_results = {
+                t: {**v, "event_opr": ev_oprs.get(t), "event_dpr": ev_dprs.get(t)}
+                for t, v in team_results.items()
+            }
+        else:
+            team_results = {}
 
     rows = list(team_results.values())
     if min_matches > 0:

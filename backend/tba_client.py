@@ -12,6 +12,8 @@ TBA API client with:
 import asyncio
 import json
 import logging
+import re
+import time
 from typing import Any, List, Optional, Dict
 
 import httpx
@@ -29,6 +31,23 @@ _STALE_WARNING: bool = False
 
 # Cap concurrent TBA requests to avoid rate-limiting
 _SEM = asyncio.Semaphore(10)
+
+# Minimum age (seconds) before we bother re-checking TBA, even with ETags.
+# Ordered from most specific to least specific.
+_PATH_TTL: list[tuple[re.Pattern, int]] = [
+    (re.compile(r"^/events/\d+$"),          6 * 3600),  # season event list: 6 h
+    (re.compile(r"^/event/[^/]+/teams"),     2 * 3600),  # event roster: 2 h
+    (re.compile(r"^/event/[^/]+/matches"),   8 * 60),    # match data: 8 min
+    (re.compile(r"^/team/frc\d+$"),         24 * 3600),  # team info: 24 h
+]
+_DEFAULT_TTL = 5 * 60  # 5 min fallback
+
+
+def _ttl_for(path: str) -> int:
+    for pattern, ttl in _PATH_TTL:
+        if pattern.match(path):
+            return ttl
+    return _DEFAULT_TTL
 
 # Event types to skip when fetching matches (no match data worth processing)
 _SKIP_EVENT_TYPES = {99, 100}   # Offseason, Preseason
@@ -51,6 +70,13 @@ async def _tba_fetch(path: str) -> Optional[Any]:
 
     endpoint = f"{CONFIG.tba_base_url}{path}"
     cached = get_cached(endpoint)
+
+    # Skip network entirely if the cached copy is still within TTL
+    if cached and cached.get("response_body"):
+        age = time.time() - (cached.get("fetch_timestamp") or 0)
+        if age < _ttl_for(path):
+            logger.debug("TTL cache hit for %s (age=%.0fs)", path, age)
+            return json.loads(cached["response_body"])
 
     headers = {"X-TBA-Auth-Key": CONFIG.tba_auth_key}
     if cached and cached.get("etag"):
@@ -106,7 +132,7 @@ def is_data_stale() -> bool:
 async def get_season_events(year: int) -> List[Dict]:
     """
     Fetch all events for a season, filtering out offseason and preseason entries.
-    Only returns events within the target year (by start_date).
+    Returns all events worldwide within the target year (by start_date).
     """
     data = await _tba_fetch(f"/events/{year}")
     if not isinstance(data, list):
@@ -121,11 +147,6 @@ async def get_season_events(year: int) -> List[Dict]:
         # Skip events whose start_date is not in the target year
         start = ev.get("start_date", "")
         if start and not start.startswith(str(year)):
-            continue
-            
-        # Filter strictly down to California to reduce API calls
-        state = ev.get("state_prov", "")
-        if state not in ("CA", "California"):
             continue
             
         filtered.append(ev)

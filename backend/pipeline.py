@@ -16,6 +16,7 @@ Orchestrates a full season-wide AOPR solve:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
 import time
@@ -30,7 +31,7 @@ from config import CONFIG
 from tba_client import get_season_events, get_event_matches, get_event_teams, is_data_stale
 from match_normalizer import normalize_matches, MatchRecord
 from matrix_builder import build_matrices, MatrixBundle
-from solver import _choose_damp, solve_opr_dpr, solve_weighted
+from solver import _choose_damp, solve_opr_dpr, solve_weighted, solve_qdpr, solve_wdpr, clear_solver_cache
 from metrics import (
     compute_residuals,
     compute_noise_sigma,
@@ -52,6 +53,29 @@ logger = logging.getLogger(__name__)
 # Module-level result cache so the API can serve instantly while refresh runs
 _last_results: Optional[Dict[str, Any]] = None
 _last_solve_time: float = 0.0
+_last_dataset_hash: str = ""
+
+
+def _compute_dataset_hash(matches: List[MatchRecord], config_hash: str) -> str:
+    """Deterministic fingerprint of match data + config. Cache key for pipeline-level skip."""
+    h = hashlib.md5(usedforsecurity=False)
+    for m in sorted(matches, key=lambda m: m.match_key):
+        h.update(f"{m.match_key}|{m.red_score}|{m.blue_score}".encode())
+    h.update(config_hash.encode())
+    return h.hexdigest()
+
+
+def _config_hash() -> str:
+    import json
+    params = {
+        "noise_exclusion_sigma": CONFIG.noise_exclusion_sigma,
+        "oppr_breaker_sigma": CONFIG.oppr_breaker_sigma,
+        "time_decay_half_life_days": CONFIG.time_decay_half_life_days,
+        "dpr_weight_power": CONFIG.dpr_weight_power,
+        "min_matches_to_rank": CONFIG.min_matches_to_rank,
+        "ridge_lambda": CONFIG.aopr.ridge_lambda,
+    }
+    return hashlib.md5(json.dumps(params, sort_keys=True).encode(), usedforsecurity=False).hexdigest()
 
 
 def _safe(v: Any, decimals: int = 3) -> float:
@@ -72,9 +96,10 @@ async def run_season_pipeline() -> Dict[str, Any]:
     Execute the full pipeline for the current season.
     Returns a results dict keyed by team number.
     """
-    global _last_results, _last_solve_time
+    global _last_results, _last_solve_time, _last_dataset_hash
     t0 = time.perf_counter()
     year = CONFIG.season_year
+    cfg_hash = _config_hash()
 
     logger.info("=== Starting AOPR pipeline for %d ===", year)
 
@@ -141,14 +166,25 @@ async def run_season_pipeline() -> Dict[str, Any]:
         logger.warning("No matches available; aborting pipeline")
         return {}
 
+    # --- Dataset hash + pipeline-level cache check -------------------------
+    dataset_hash = _compute_dataset_hash(all_matches, cfg_hash)
+    if dataset_hash == _last_dataset_hash and _last_results:
+        logger.info("Dataset unchanged (hash=%.8s); returning cached results", dataset_hash)
+        return _last_results
+
+    # Flush solver-level cache so stale matrix results don't survive between runs
+    clear_solver_cache()
+
     # --- 3. Build matrices (initial pass, quality_weight=1.0 everywhere) --
     bundle = build_matrices(all_matches, event_team_counts, event_types)
     team_list = bundle.team_list
     n_teams = len(team_list)
+    team_idx: Dict[int, int] = {t: i for i, t in enumerate(team_list)}
 
     # --- 4. Baseline OPR + DPR solve --------------------------------------
     opr, dpr, solver_info = solve_opr_dpr(
-        bundle.A, bundle.A_opp, bundle.y, bundle.y_opp, bundle.weights
+        bundle.A, bundle.A_opp, bundle.y, bundle.y_opp, bundle.weights,
+        dpr_weight_power=CONFIG.dpr_weight_power,
     )
 
     # --- 5. Residuals, noise sigma, two-tier anomaly detection --------------
@@ -161,12 +197,45 @@ async def run_season_pipeline() -> Dict[str, Any]:
     # --- 6. Rebuild matrices with breaker weights applied -----------------
     bundle = build_matrices(all_matches, event_team_counts, event_types)
 
-    # --- 7. Re-solve baseline with updated weights ------------------------
-    opr, dpr, solver_info = solve_opr_dpr(
-        bundle.A, bundle.A_opp, bundle.y, bundle.y_opp, bundle.weights
-    )
+    # --- 7. Final OPR solve (quality_weight-adjusted weights) ---------------
+    # OPR must come first; DPR (QDPR) depends on opponent OPRs.
+    # If ridge_lambda is set explicitly, override the adaptive damp selection.
+    ridge_override: Optional[float] = CONFIG.aopr.ridge_lambda if CONFIG.aopr.ridge_lambda > 0 else None
+    opr, _, info_opr = solve_weighted(bundle.A, bundle.y, bundle.weights, damp=ridge_override)
     residuals = compute_residuals(bundle.A, opr, bundle.y)
     sigma = compute_noise_sigma(residuals)
+
+    # Per-row opposing-alliance OPR — shared by both DPR and WDPR.
+    row_opp_oprs = np.zeros(len(bundle.y))
+    for ri, (mi, side) in enumerate(bundle.row_to_match):
+        m = all_matches[mi]
+        opp_teams = m.blue_teams if side == 0 else m.red_teams
+        row_opp_oprs[ri] = sum(max(opr[team_idx[t]], 0.0) for t in opp_teams if t in team_idx)
+
+    valid_opp = row_opp_oprs[row_opp_oprs > 0]
+    avg_opp_opr = float(np.mean(valid_opp)) if len(valid_opp) > 0 else 1.0
+
+    # Standard DPR: traditional points-suppressed metric, no quality weighting.
+    # Re-uses the already-computed OPR; solver cache makes this cheap.
+    from solver import _build_y_dpr
+    y_std_dpr = _build_y_dpr(bundle.y, opr, bundle.A)
+    std_dpr, _, _ = solve_weighted(bundle.A, y_std_dpr, bundle.weights, damp=ridge_override)
+
+    # DPR = quality-weighted DPR: each row scaled by opponent alliance OPR.
+    # Suppressing a strong alliance contributes more than suppressing a weak one.
+    # NOTE: operates on a similar scale to plain DPR (normalised by avg_opp_opr)
+    # but defender_threshold_multiplier may need retuning if results look off.
+    dpr, info_dpr = solve_qdpr(
+        bundle.A, bundle.y, bundle.weights, opr,
+        row_opp_oprs, avg_opp_opr,
+        dpr_weight_power=CONFIG.dpr_weight_power,
+    )
+    solver_info = {"opr": info_opr, "dpr": info_dpr}
+
+    # --- 7.5. WDPR (raw opponent-OPR-weighted DPR, unnormalised) -------------
+    wdpr, _ = solve_wdpr(
+        bundle.A, bundle.y, bundle.weights, opr, row_opp_oprs,
+    )
 
     # --- 8. Defender detection --------------------------------------------
     match_counts = compute_match_counts(bundle.A, team_list)
@@ -210,9 +279,11 @@ async def run_season_pipeline() -> Dict[str, Any]:
     variability = compute_variability(bundle.A, residuals, team_list)
 
     # Sanitise raw solver arrays
-    opr  = np.where(np.isfinite(opr),  opr,  0.0)
-    dpr  = np.where(np.isfinite(dpr),  dpr,  0.0)
-    aopr = np.where(np.isfinite(aopr), aopr, 0.0)
+    opr     = np.where(np.isfinite(opr),     opr,     0.0)
+    dpr     = np.where(np.isfinite(dpr),     dpr,     0.0)
+    std_dpr = np.where(np.isfinite(std_dpr), std_dpr, 0.0)
+    aopr    = np.where(np.isfinite(aopr),    aopr,    0.0)
+    wdpr    = np.where(np.isfinite(wdpr),    wdpr,    0.0)
 
     # --- 12. Assemble per-team results + Synergy + Roles ------------------
     results: Dict[int, Dict[str, Any]] = {}
@@ -271,20 +342,28 @@ async def run_season_pipeline() -> Dict[str, Any]:
             "team_number": team,
             "nickname":    team_nicknames.get(team, ""),
             "opr":         _safe(opr[i]),
-            "dpr":         _safe(dpr[i]),
+            "dpr":         _safe(std_dpr[i]),   # standard (traditional) DPR for display
+            "qdpr":        _safe(dpr[i]),        # quality-weighted DPR used internally
+            "wdpr":        _safe(wdpr[i]),
             "synergy":     _safe(synergy),
             "aopr":        _safe(aopr[i]),
-            "delta":       _safe(float(aopr[i]) - float(opr[i])),
+            "delta":       _safe(float(aopr[i]) - float(opr[i])),  # delta_avg — updated below
+            "delta_avg":   _safe(float(aopr[i]) - float(opr[i])),
+            "delta_raw":   0.0,  # populated in step 13.6
             "variability": _safe(variability.get(team, 0.0)),
             "match_count": mc,
             "breaker_count": team_breaker_counts.get(team, 0),
+            "is_defender": team in defenders,
             "primary_role": role,
             "low_match_warning": mc < CONFIG.min_matches_to_rank,
+            # contribution stats — populated in step 13.6
+            "mean_contribution": 0.0,
+            "contribution_variance": 0.0,
+            "consistency": 0.0,
         }
 
     # --- 13. Build full match-row index (in-memory only, not persisted) ------
     #   Two rows per match. Each row records everything needed for team history.
-    team_idx: Dict[int, int] = {t: i for i, t in enumerate(team_list)}
     aopr_arr = np.asarray(aopr)
     opr_arr  = np.asarray(opr)
 
@@ -312,7 +391,10 @@ async def run_season_pipeline() -> Dict[str, Any]:
             # defender keys on opposing side
             def_keys = [f"frc{t}" for t in opposing if t in defenders]
 
-            row = {
+            # Precompute alliance total positive OPR for contribution distribution
+            alliance_pos_opr = sum(max(opr_arr[team_idx[t]], 0.0) for t in scoring if t in team_idx)
+
+            base_row = {
                 "match_key":    m.match_key,
                 "event_key":    m.event_key,
                 "event_name":   event_meta.get(m.event_key, {}).get("name", m.event_key),
@@ -333,16 +415,51 @@ async def run_season_pipeline() -> Dict[str, Any]:
                 "defender_keys":  def_keys,
             }
 
+            n_scoring = max(len(scoring), 1)
             for t in scoring:
                 if t in team_match_rows:
-                    team_match_rows[t].append(row)
+                    t_opr = max(opr_arr[team_idx[t]], 0.0) if t in team_idx else 0.0
+                    share = t_opr / alliance_pos_opr if alliance_pos_opr > 0 else 1.0 / n_scoring
+                    team_match_rows[t].append({
+                        **base_row,
+                        "contribution_value": _safe(actual_score * share, 1),
+                        "team_refund_share":  _safe(float(refunds[ri]) * share, 2),
+                    })
 
     # Sort each team's rows by timestamp ascending
     for t in team_match_rows:
         team_match_rows[t].sort(key=lambda r: r["timestamp"])
 
-    # --- 13.5 Compute Event OPRs ----------------------------------------------
+    # --- 13.6 Per-team contribution stats + delta_raw -------------------------
+    for i, team in enumerate(team_list):
+        rows = team_match_rows[team]
+        if rows:
+            contributions = [r["contribution_value"] for r in rows]
+            mean_contrib = float(np.mean(contributions))
+            contrib_variance = float(np.var(contributions))
+            contrib_std = float(np.std(contributions))
+            consistency = float(1.0 / (1.0 + contrib_std))
+
+            # delta_raw: per-match refund average over only defended matches
+            # (avoids diluting defensive impact across undefended matches)
+            defended = [r["team_refund_share"] for r in rows if r.get("team_refund_share", 0) > 0.1]
+            delta_raw = float(np.mean(defended)) if defended else 0.0
+        else:
+            mean_contrib = contrib_variance = 0.0
+            consistency = 1.0
+            delta_raw = 0.0
+
+        results[team].update({
+            "delta_raw":            _safe(delta_raw),
+            "delta":                _safe(delta_raw),   # Δ column uses raw value
+            "mean_contribution":    _safe(mean_contrib),
+            "contribution_variance":_safe(contrib_variance),
+            "consistency":          _safe(consistency, 4),
+        })
+
+    # --- 13.5 Compute per-event OPR + DPR (quality-weighted) -----------------
     event_oprs: Dict[str, Dict[int, float]] = {}
+    event_dprs: Dict[str, Dict[int, float]] = {}
     for ek in event_meta.keys():
         ev_matches = [m for m in all_matches if m.event_key == ek]
         if not ev_matches:
@@ -350,18 +467,42 @@ async def run_season_pipeline() -> Dict[str, Any]:
         try:
             eb = build_matrices(ev_matches)
             e_opr, _, _ = solve_weighted(eb.A, eb.y, eb.weights)
-            e_dict = {}
+            e_team_idx = {t: i for i, t in enumerate(eb.team_list)}
+
+            e_row_opp_oprs = np.zeros(len(eb.y))
+            for ri, (mi, side) in enumerate(eb.row_to_match):
+                m = ev_matches[mi]
+                opp_teams = m.blue_teams if side == 0 else m.red_teams
+                e_row_opp_oprs[ri] = sum(
+                    max(e_opr[e_team_idx[t]], 0.0) for t in opp_teams if t in e_team_idx
+                )
+
+            valid_e_opp = e_row_opp_oprs[e_row_opp_oprs > 0]
+            e_avg_opp_opr = float(np.mean(valid_e_opp)) if len(valid_e_opp) > 0 else 1.0
+
+            e_dpr, _ = solve_qdpr(
+                eb.A, eb.y, eb.weights, e_opr,
+                e_row_opp_oprs, e_avg_opp_opr,
+                dpr_weight_power=CONFIG.dpr_weight_power,
+            )
+
+            opr_dict: Dict[int, float] = {}
+            dpr_dict: Dict[int, float] = {}
             for ti, team in enumerate(eb.team_list):
-                e_dict[team] = _safe(e_opr[ti])
-            event_oprs[ek] = e_dict
+                opr_dict[team] = _safe(e_opr[ti])
+                dpr_dict[team] = _safe(e_dpr[ti])
+            event_oprs[ek] = opr_dict
+            event_dprs[ek] = dpr_dict
         except Exception as exc:
-            logger.warning("Failed event OPR for %s: %s", ek, exc)
+            logger.warning("Failed event OPR/DPR for %s: %s", ek, exc)
 
     # --- 14. Persist audit + snapshot; keep match rows in memory only ---------
     save_audit_records(audit_rows)
+    solve_ts = datetime.now().timestamp()
     snapshot_payload = {
         "team_results": results,
         "event_oprs": event_oprs,
+        "event_dprs": event_dprs,
         "meta": {
             "year": year,
             "total_matches": len(all_matches),
@@ -372,8 +513,11 @@ async def run_season_pipeline() -> Dict[str, Any]:
             "defender_count": len(defenders),
             "solver_info": solver_info,
             "aopr_solver_info": solver_info,
-            "solve_timestamp": datetime.now().timestamp(),
+            "solve_timestamp": solve_ts,
             "event_meta": event_meta,
+            # Reproducibility tracking
+            "dataset_hash": dataset_hash,
+            "config": CONFIG.aopr.to_dict(),
         },
         "audit": audit_rows,
         "event_membership": event_membership,
@@ -390,7 +534,8 @@ async def run_season_pipeline() -> Dict[str, Any]:
     _last_results = snapshot_payload
     # Attach match rows to in-memory copy ONLY (not in the SQLite snapshot)
     _last_results["team_match_rows"] = team_match_rows
-    _last_solve_time = datetime.now().timestamp()
+    _last_solve_time = solve_ts
+    _last_dataset_hash = dataset_hash
     return _last_results
 
 
@@ -424,5 +569,10 @@ def _coerce_keys(results: Dict[str, Any]) -> Dict[str, Any]:
         results["event_oprs"] = {
             ek: {int(t): opr for t, opr in val_dict.items()}
             for ek, val_dict in results["event_oprs"].items()
+        }
+    if "event_dprs" in results:
+        results["event_dprs"] = {
+            ek: {int(t): dpr for t, dpr in val_dict.items()}
+            for ek, val_dict in results["event_dprs"].items()
         }
     return results

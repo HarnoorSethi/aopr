@@ -8,17 +8,25 @@ class TeamStats(BaseModel):
     team_number: int
     nickname: str = ""
     opr: float = Field(description="Raw offensive power rating")
-    dpr: float = Field(description="Defensive power rating")
+    dpr: float = Field(description="Standard defensive power rating (points suppressed below expectation)")
+    wdpr: float = Field(default=0.0, description="Weighted DPR: base weights × raw sum of opponents' OPR")
     synergy: float = Field(default=0.0, description="Average positive residual (Boost ceiling)")
     aopr: float = Field(description="Adjusted OPR after defensive refunds")
     event_opr: Optional[float] = Field(default=None, description="Event-specific OPR")
-    delta: float = Field(description="AOPR − OPR")
+    event_dpr: Optional[float] = Field(default=None, description="Event-specific DPR")
+    delta: float = Field(description="Raw Δ — avg refund over defended matches only")
+    delta_avg: float = Field(default=0.0, description="Smoothed Δ — AOPR minus OPR (season average)")
+    delta_raw: float = Field(default=0.0, description="Raw Δ — avg refund per defended match")
     variability: float = Field(description="Match-to-match instability score")
     match_count: int
     breaker_count: int = Field(default=0, description="Matches flagged as OPR breakers or excluded")
+    is_defender: bool = Field(default=False, description="Whether the team was classified as a defender")
     primary_role: str = Field(default="", description="Algorithmic role classification")
     low_match_warning: bool = False
     rank: int = 0
+    mean_contribution: float = Field(default=0.0, description="Average per-match score share")
+    contribution_variance: float = Field(default=0.0, description="Variance of per-match contributions")
+    consistency: float = Field(default=0.0, description="1 / (1 + std_dev_contributions); higher = more consistent")
 
 
 class MatchAuditRow(BaseModel):
