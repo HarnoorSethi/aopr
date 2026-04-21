@@ -147,11 +147,16 @@ def _to_team_stats(r: dict) -> TeamStats:
         event_opr=r.get("event_opr"),
         event_dpr=r.get("event_dpr"),
         delta=r["delta"],
+        delta_avg=r.get("delta_avg", 0.0),
+        delta_raw=r.get("delta_raw", 0.0),
         variability=r["variability"],
         match_count=r["match_count"],
         breaker_count=r.get("breaker_count", 0),
         is_defender=r["is_defender"],
         low_match_warning=r["low_match_warning"],
+        mean_contribution=r.get("mean_contribution", 0.0),
+        contribution_variance=r.get("contribution_variance", 0.0),
+        consistency=r.get("consistency", 0.0),
     )
 
 

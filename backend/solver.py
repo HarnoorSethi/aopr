@@ -1,13 +1,39 @@
 from __future__ import annotations
 
+import hashlib
 import logging
-from typing import Tuple, Dict
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Solver-level in-memory cache
+# Keyed by (matrix hash, damp). Avoids re-solving identical systems within
+# a pipeline run (e.g. rebuild after breaker weights, repeated event solves).
+# ---------------------------------------------------------------------------
+
+_SOLVER_CACHE: Dict[str, Tuple[np.ndarray, float, dict]] = {}
+
+
+def _make_solver_key(A: sp.spmatrix, y: np.ndarray, weights: np.ndarray, damp) -> str:
+    h = hashlib.md5(usedforsecurity=False)
+    csr = A.tocsr()
+    h.update(csr.data.tobytes())
+    h.update(csr.indices.tobytes())
+    h.update(csr.indptr.tobytes())
+    h.update(y.tobytes())
+    h.update(weights.tobytes())
+    h.update(str(damp).encode())
+    return h.hexdigest()
+
+
+def clear_solver_cache() -> None:
+    """Flush cached solve results. Called at the start of each pipeline run."""
+    _SOLVER_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +99,11 @@ def solve_weighted(
     if damp is None:
         damp = _choose_damp(Aw)
 
+    cache_key = _make_solver_key(A, y, weights, damp)
+    if cache_key in _SOLVER_CACHE:
+        logger.debug("Solver cache hit (key=%.8s)", cache_key)
+        return _SOLVER_CACHE[cache_key]
+
     result = spla.lsqr(Aw, yw, damp=damp, iter_lim=50_000, atol=1e-10, btol=1e-10)
     x, istop, itn, r1norm = result[0], result[1], result[2], result[3]
 
@@ -85,7 +116,9 @@ def solve_weighted(
         "n_rows": int(A.shape[0]),
     }
     logger.debug("lsqr solve: damp=%.4f istop=%d itn=%d r1norm=%.3f", damp, istop, itn, r1norm)
-    return x, damp, info
+    out = (x, damp, info)
+    _SOLVER_CACHE[cache_key] = out
+    return out
 
 
 # ---------------------------------------------------------------------------
